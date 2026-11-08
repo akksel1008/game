@@ -1349,7 +1349,10 @@
             </div>
           </div>
 
-          <div style="display: flex; gap: 12px; justify-content: center;">
+          <div style="display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;">
+            <button class="btn btn-secondary btn-lg" onclick="downloadResultCSV()">
+              📥 게임 결과(CSV) 다운로드
+            </button>
             <button class="btn btn-primary btn-lg" onclick="resetToLobby()">
               🔄 새로운 4자리 방 개설 및 준비하기
             </button>
@@ -1370,7 +1373,7 @@
 
           <div style="background: var(--bg-subtle); padding: 18px; border-radius: var(--radius-md); border: 1px solid var(--border-color); margin-bottom: 20px; text-align: left;">
             <label style="font-size: 0.85rem; font-weight: 700; color: var(--text-sub); display: block; margin-bottom: 6px;">선생님이 안내한 4자리 숫자 방 번호</label>
-            <input type="text" id="s-room-input" class="text-input" style="width: 100%; letter-spacing: 4px; font-size: 1.3rem; text-align: center;" placeholder="숫자 4자리 입력" maxlength="4" autofocus>
+            <input type="text" id="s-room-input" class="text-input" style="width: 100%; letter-spacing: 4px; font-size: 1.3rem; text-align: center;" placeholder="숫자 4자리 입력" maxlength="4" onkeydown="if(event.key==='Enter') enterRoomAsStudent()" autofocus>
           </div>
 
           <button class="btn btn-primary" style="width: 100%; padding: 14px; font-size: 1.1rem;" onclick="enterRoomAsStudent()">
@@ -1558,14 +1561,49 @@
       document.getElementById('form-teacher-login').style.display = !isStudent ? 'flex' : 'none';
     }
 
-    function handleTeacherLoginSubmit(e) {
+    async function handleTeacherLoginSubmit(e) {
       e.preventDefault();
       const id = document.getElementById('login-teacher-id').value.trim();
       const pw = document.getElementById('login-teacher-pw').value.trim();
 
       if (id === 't1' && pw === 't1') {
-        gameState.roomCode = generate4DigitRoomCode();
-        localStorage.setItem('active_wordchain_room_code', gameState.roomCode);
+        let roomCode = '';
+        // 1. 서버에 이미 활성화되어 파일(room_code.txt)에 저장된 방 번호가 있는지 확인
+        try {
+          const activeResp = await fetch('/api/rooms/active');
+          if (activeResp.ok) {
+            const activeData = await activeResp.json();
+            if (activeData.exists && activeData.room_code) {
+              roomCode = activeData.room_code;
+            }
+          }
+        } catch(err) {
+          console.warn("활성 방 확인 실패:", err);
+        }
+
+        // 2. 저장된 방 번호가 없으면 새 방 개설 API 호출 (파일 자동 저장)
+        if (!roomCode) {
+          try {
+            const resp = await fetch('/api/create-room', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ teacher_id: 't1', teacher_pw: 't1' })
+            });
+            if (resp.ok) {
+              const data = await resp.json();
+              roomCode = data.room_code;
+            }
+          } catch(err) {
+            console.warn("새 방 개설 API 실패:", err);
+          }
+        }
+
+        if (!roomCode) {
+          roomCode = generate4DigitRoomCode();
+        }
+
+        gameState.roomCode = roomCode;
+        localStorage.setItem('active_teacher_room_code', roomCode);
 
         loginAs({
           id: 't1',
@@ -1574,7 +1612,7 @@
           studentNumber: ''
         });
 
-        initWebSocket(gameState.roomCode);
+        initWebSocket(roomCode);
       } else {
         alert("교사용 접속 ID 또는 비밀번호가 올바르지 않습니다.\n(ID: t1, PW: t1)");
       }
@@ -1652,9 +1690,18 @@
     }
 
     function logout() {
+      if (socket) {
+        try { socket.close(); } catch(e) {}
+      }
       currentSession = null;
       sessionStorage.removeItem('wordchain_session_v4');
+      sessionStorage.removeItem('wordchain_student_joined');
+      sessionStorage.removeItem('wordchain_student_room');
       myStudentProfile.joined = false;
+      myStudentProfile.id = '';
+      myStudentProfile.name = '';
+      myStudentProfile.studentNumber = '';
+      gameState.roomCode = '';
       document.getElementById('student-room-confirm').style.display = 'block';
       document.getElementById('student-waiting').style.display = 'none';
       document.getElementById('student-game').style.display = 'none';
@@ -1988,11 +2035,8 @@
       FINISHED: 'FINISHED'
     };
 
-    const initialCode = localStorage.getItem('active_wordchain_room_code') || generate4DigitRoomCode();
-    localStorage.setItem('active_wordchain_room_code', initialCode);
-
     let gameState = {
-      roomCode: initialCode,
+      roomCode: '',
       stage: GAME_STAGES.LOBBY,
       maxRounds: 5,
       currentRound: 1,
@@ -2456,7 +2500,7 @@
       }
 
       gameState.roomCode = generate4DigitRoomCode();
-      localStorage.setItem('active_wordchain_room_code', gameState.roomCode);
+      localStorage.setItem('active_teacher_room_code', gameState.roomCode);
       gameState.stage = GAME_STAGES.LOBBY;
       gameState.currentRound = 1;
       gameState.remainingTotalSeconds = gameState.totalTimeSeconds;
@@ -2467,11 +2511,45 @@
       showToast(`새로운 4자리 방 번호 [${gameState.roomCode}]가 생성되었습니다!`);
     }
 
+    function downloadResultCSV() {
+      if (!gameState || !gameState.players || gameState.players.length === 0) {
+        alert("다운로드할 결과 데이터가 없습니다.");
+        return;
+      }
+
+      const sorted = [...gameState.players].sort((a, b) => b.score - a.score);
+      let csvContent = "\uFEFF"; // 한글 엑셀 호환용 UTF-8 BOM
+      csvContent += "등수,학번,닉네임,최종점수,성공단어수,성공단어목록\n";
+
+      sorted.forEach((p, idx) => {
+        const rank = idx + 1;
+        const sNum = p.studentNumber || p.id;
+        const name = `"${(p.name || '').replace(/"/g, '""')}"`;
+        const score = p.score || 0;
+        const wordCount = (p.successWords || []).length;
+        const words = `"${(p.successWords || []).join(', ').replace(/"/g, '""')}"`;
+        csvContent += `${rank},${sNum},${name},${score},${wordCount},${words}\n`;
+      });
+
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const now = new Date();
+      const dateStr = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
+      a.download = `끝말잇기_결과_${gameState.roomCode || 'game'}_${dateStr}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast("📊 결과 CSV 파일이 다운로드되었습니다!");
+    }
+
     /* ==============================================================
        5. Student Participant Logic
        ============================================================== */
 
-    function enterRoomAsStudent() {
+    async function enterRoomAsStudent() {
       const codeInput = document.getElementById('s-room-input').value.trim();
       if (!codeInput) {
         alert("선생님이 안내한 4자리 숫자 방 번호를 입력해주세요.");
@@ -2482,37 +2560,28 @@
         return;
       }
 
-      // 소켓 연결이 되어 있지 않은 로컬 환경일 때만 gameState.roomCode 체크
-      if (!isSocketConnected && gameState.roomCode && codeInput !== gameState.roomCode) {
-        alert(`입력하신 방 번호(${codeInput})가 일치하지 않습니다.\n선생님 화면에 표시된 4자리 방 번호(${gameState.roomCode})를 확인해주세요.`);
-        return;
+      // 서버의 room_code.txt 파일에 저장된 선생님 방 번호와 일치하는지 확인
+      if (window.location.protocol !== 'file:') {
+        try {
+          const resp = await fetch(`/api/rooms/${codeInput}/check`);
+          if (resp.ok) {
+            const data = await resp.json();
+            if (!data.exists) {
+              alert(`입력하신 방 번호 [${codeInput}]번 방을 찾을 수 없습니다.\n선생님 화면에 표시된 4자리 방 번호를 확인해주세요.`);
+              return;
+            }
+          }
+        } catch (err) {
+          console.warn("방 확인 API 실패, 소켓 연결 진행:", err);
+        }
       }
 
       gameState.roomCode = codeInput;
-      initWebSocket(codeInput);
-
       myStudentProfile.joined = true;
+      sessionStorage.setItem('wordchain_student_joined', 'true');
+      sessionStorage.setItem('wordchain_student_room', codeInput);
 
-      const joinMsg = {
-        type: 'STUDENT_JOIN_REQUEST',
-        player: {
-          id: myStudentProfile.id,
-          name: myStudentProfile.name,
-          studentNumber: myStudentProfile.studentNumber
-        }
-      };
-
-      if (isSocketConnected && socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({
-          type: 'STUDENT_JOIN',
-          id: myStudentProfile.id,
-          name: myStudentProfile.name,
-          studentNumber: myStudentProfile.studentNumber
-        }));
-      } else {
-        syncChannel.postMessage(joinMsg);
-        handleStudentJoin(joinMsg.player);
-      }
+      initWebSocket(codeInput);
 
       sounds.init();
       openRulesModal();
@@ -2919,10 +2988,26 @@
           currentSession = null;
         }
       }
+
+      const savedJoined = sessionStorage.getItem('wordchain_student_joined') === 'true';
+      const savedRoom = sessionStorage.getItem('wordchain_student_room');
+      if (currentSession && currentSession.role === 'student' && savedJoined && savedRoom) {
+        myStudentProfile.joined = true;
+        gameState.roomCode = savedRoom;
+      }
+
       applySessionRole();
 
-      if (gameState.roomCode) {
-        initWebSocket(gameState.roomCode);
+      if (currentSession && currentSession.role === 'teacher') {
+        const teacherRoom = localStorage.getItem('active_teacher_room_code') || gameState.roomCode;
+        if (teacherRoom) {
+          gameState.roomCode = teacherRoom;
+          initWebSocket(teacherRoom);
+        }
+      } else if (currentSession && currentSession.role === 'student' && myStudentProfile.joined) {
+        if (gameState.roomCode) {
+          initWebSocket(gameState.roomCode);
+        }
       }
     });
   </script>

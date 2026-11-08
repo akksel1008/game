@@ -9,10 +9,15 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
-
-app = FastAPI(title="EduWord Chain Game Server")
+import httpx
+from dotenv import load_dotenv
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# .env 환경 변수 로드
+load_dotenv(os.path.join(CURRENT_DIR, ".env"))
+
+app = FastAPI(title="EduWord Chain Game Server")
 
 # -------------------------------------------------------------
 # 1. 두음법칙 (Initial Sound Rule) & 사전 검증 모듈
@@ -76,6 +81,88 @@ if not STANDARD_WORDS:
         "늘보","늘품","늘솔길","늘비","름봉","름료","곽란","곽지","곽밥","릇밥","릇들","듐석","튬석","슘석","늣치","늴리리","역사","역무원","역도","역할","역전","역사학","역지사지","유리","유성","유머","유람선","유행","유치원","유적","유기농","유령","양식","양초","양심","양호실","양파","여름","여자","여우","여행","여권","여유","요리","요일","요구르트","요람","요술","요정","요새"
     ]
     STANDARD_WORDS = set(DEFAULT_WORDS)
+
+# -------------------------------------------------------------
+# 1-1. 국립국어원 표준국어대사전 Open API 검증 모듈
+# -------------------------------------------------------------
+API_VERIFIED_WORDS_CACHE: Dict[str, bool] = {}
+
+def get_korean_dict_api_key() -> str:
+    """매 호출 시 .env 파일에서 최신 API 키를 읽어옵니다 (서버 재시작 없이 반영)."""
+    load_dotenv(os.path.join(CURRENT_DIR, ".env"), override=True)
+    return os.getenv("KOREAN_DICT_API_KEY", "").strip()
+
+async def check_word_with_stdict_api(word: str) -> Optional[bool]:
+    """
+    국립국어원 표준국어대사전 Open API (https://stdict.korean.go.kr/api/search.do)
+    - True: 국립국어원에 등재된 올바른 표준어
+    - False: 국립국어원에 등재되지 않은 단어
+    - None: API 키가 없거나 네트워크 오류 시 (로컬 사전 fallback)
+    """
+    if not word:
+        return False
+
+    # 1. 메모리 캐시 확인 (반복 검증 속도 최적화)
+    if word in API_VERIFIED_WORDS_CACHE:
+        return API_VERIFIED_WORDS_CACHE[word]
+
+    # 2. 로컬 기본 표준어 세트에 이미 등록된 경우 즉시 인정
+    if word in STANDARD_WORDS:
+        API_VERIFIED_WORDS_CACHE[word] = True
+        return True
+
+    # 3. API 키 확인
+    api_key = get_korean_dict_api_key()
+    if not api_key or api_key == "YOUR_OPENAPI_KEY_HERE":
+        return None  # API 키 미입력 시 None 반환 -> 로컬 사전 모드로 fallback
+
+    url = "https://stdict.korean.go.kr/api/search.do"
+    params = {
+        "key": api_key,
+        "q": word,
+        "req_type": "json",
+        "type_search": "search",
+        "part": "word"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=3.5, verify=False) as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    channel = data.get("channel", {})
+                    total = int(channel.get("total", 0))
+                    items = channel.get("item", [])
+
+                    # 검색된 표제어 중 특수문자, 하이픈 제거 후 정확 일치 검사
+                    is_valid = False
+                    for it in items:
+                        clean_item_word = re.sub(r'[^가-힣]', '', it.get("word", ""))
+                        if clean_item_word == word:
+                            is_valid = True
+                            break
+
+                    if not is_valid and total > 0:
+                        for it in items:
+                            raw_w = it.get("word", "").replace("-", "").replace("^", "").strip()
+                            if raw_w == word:
+                                is_valid = True
+                                break
+
+                    API_VERIFIED_WORDS_CACHE[word] = is_valid
+                    status_str = "✅ 국립국어원 등재 확인" if is_valid else "❌ 미등재"
+                    print(f"[국립국어원 API] 단어 '{word}' 검증 결과: {status_str} (검색 {total}건)")
+                    return is_valid
+                except Exception as json_err:
+                    print(f"[국립국어원 API] JSON 파싱 오류: {json_err}")
+                    return None
+            else:
+                print(f"[국립국어원 API] HTTP {resp.status_code} 응답")
+                return None
+    except Exception as e:
+        print(f"[국립국어원 API] 호출 예외 ({e}) -> 로컬 사전 대체")
+        return None
 
 AI_QUIZ_POOL = [
     {"word": "서울", "def": "대한민국의 수도이자 정치, 경제, 문화의 중심지인 특별시", "chosung": "ㅅ ㅇ", "len": 2},
@@ -200,7 +287,7 @@ class GameRoom:
             self.total_timer_task.cancel()
             self.total_timer_task = None
 
-    def validate_word(self, word: str) -> dict:
+    async def validate_word(self, word: str) -> dict:
         word = word.strip()
         if len(word) < 2:
             return {"valid": False, "reason": "글자 수는 2글자 이상이어야 합니다."}
@@ -221,9 +308,16 @@ class GameRoom:
                 dueum_info = f" (두음법칙: {', '.join(allowed_starts)})" if len(allowed_starts) > 1 else ""
                 return {"valid": False, "reason": f"'{last_char}'{dueum_info}(으)로 시작해야 합니다."}
 
-        # 국립국어원 표준국어대사전 검증
-        if word not in STANDARD_WORDS:
+        # 국립국어원 표준국어대사전 Open API 검증
+        api_result = await check_word_with_stdict_api(word)
+        if api_result is True:
+            return {"valid": True, "reason": "국립국어원 표준국어대사전 등재 단어"}
+        elif api_result is False:
             return {"valid": False, "reason": "국립국어원 표준국어대사전에 등재되지 않은 단어입니다."}
+        else:
+            # API 키 미설정 또는 네트워크 오류 시 로컬 사전 검증
+            if word not in STANDARD_WORDS:
+                return {"valid": False, "reason": "국립국어원 표준국어대사전에 등재되지 않은 단어입니다."}
 
         return {"valid": True, "reason": "올바른 단어"}
 
@@ -425,7 +519,7 @@ class GameRoom:
         if not self.is_chance_mode and p_idx != self.active_player_index:
             return
 
-        val = self.validate_word(word)
+        val = await self.validate_word(word)
         if not val["valid"]:
             # 오답 감점 -5점
             player.score = max(0, player.score - 5)
@@ -535,8 +629,31 @@ class GameRoom:
 
 
 # -------------------------------------------------------------
-# 3. 전체 반(Room) 매니저
+# 3. 전체 반(Room) 매니저 & 파일 영구 저장소
 # -------------------------------------------------------------
+ROOM_CODE_FILE = os.path.join(CURRENT_DIR, "room_code.txt")
+
+def save_active_room_code(code: str):
+    """선생님이 개설한 4자리 방 번호를 파일(room_code.txt)에 저장"""
+    try:
+        with open(ROOM_CODE_FILE, "w", encoding="utf-8") as f:
+            f.write(code.strip())
+        print(f"[Room File] 방 번호 파일 저장 완료: {code} ({ROOM_CODE_FILE})")
+    except Exception as e:
+        print(f"[Room File Error] 방 번호 파일 저장 실패: {e}")
+
+def get_saved_room_code() -> Optional[str]:
+    """파일(room_code.txt)에서 현재 활성화된 선생님 방 번호 읽기"""
+    if os.path.exists(ROOM_CODE_FILE):
+        try:
+            with open(ROOM_CODE_FILE, "r", encoding="utf-8") as f:
+                code = f.read().strip()
+                if len(code) == 4 and code.isdigit():
+                    return code
+        except Exception as e:
+            print(f"[Room File Error] 방 번호 파일 읽기 실패: {e}")
+    return None
+
 ROOMS: Dict[str, GameRoom] = {}
 
 def get_or_create_room(room_code: str) -> GameRoom:
@@ -549,6 +666,12 @@ def generate_random_4digit_code() -> str:
         code = str(random.randint(1000, 9999))
         if code not in ROOMS:
             return code
+
+# 서버 기동 시 기존 저장된 방 번호가 있으면 사전 등록
+_saved_init_code = get_saved_room_code()
+if _saved_init_code:
+    get_or_create_room(_saved_init_code)
+    print(f"[Room File] 기존 파일에서 선생님 방 번호 복원 완료: {_saved_init_code}")
 
 
 # -------------------------------------------------------------
@@ -571,12 +694,27 @@ async def api_create_room(req: RoomCreateRequest):
         raise HTTPException(status_code=401, detail="교사 인증 실패 (ID: t1, PW: t1)")
     new_code = generate_random_4digit_code()
     room = get_or_create_room(new_code)
+    save_active_room_code(new_code)
     return {"room_code": new_code, "status": "ok"}
+
+@app.get("/api/rooms/active")
+async def api_get_active_room():
+    """선생님이 개설하여 파일(room_code.txt)에 저장된 활성 방 번호 반환"""
+    saved = get_saved_room_code()
+    if saved and saved not in ROOMS:
+        get_or_create_room(saved)
+    return {"room_code": saved, "exists": bool(saved)}
 
 @app.get("/api/rooms/{room_code}/check")
 async def api_check_room(room_code: str):
-    exists = room_code in ROOMS
-    return {"exists": exists, "room_code": room_code}
+    """학생이 입력한 방 번호가 선생님 파일의 방 번호 또는 메모리 방과 일치하는지 매칭 검증"""
+    saved = get_saved_room_code()
+    exists = (saved is not None and room_code == saved) or (room_code in ROOMS)
+    return {
+        "exists": exists,
+        "room_code": room_code,
+        "active_room_code": saved
+    }
 
 
 # -------------------------------------------------------------
@@ -613,6 +751,7 @@ async def websocket_game_endpoint(websocket: WebSocket, room_code: str):
                 if t_id == "t1" and t_pw == "t1":
                     room.teacher_ws = websocket
                     is_teacher = True
+                    save_active_room_code(room_code)
                     await room.broadcast_state()
 
             # B. 학생 방 입장 등록
@@ -664,8 +803,10 @@ async def websocket_game_endpoint(websocket: WebSocket, room_code: str):
                 room.reset_room(new_c)
                 # 룸 맵 키 갱신
                 ROOMS[new_c] = room
-                del ROOMS[room_code]
+                if room_code in ROOMS:
+                    del ROOMS[room_code]
                 room_code = new_c
+                save_active_room_code(new_c)
                 await room.broadcast_state()
 
     except WebSocketDisconnect:
@@ -683,6 +824,15 @@ if __name__ == "__main__":
     print("=" * 60)
     print("🌿 에듀워드 파이썬 소켓 게임 서버 (FastAPI + WebSocket)")
     print("👉 접속 주소: http://localhost:8000 또는 http://<내_컴퓨터_IP>:8000")
+    
+    dict_key = get_korean_dict_api_key()
+    if dict_key and dict_key != "YOUR_OPENAPI_KEY_HERE":
+        masked_key = dict_key[:6] + "*" * (max(0, len(dict_key) - 6))
+        print(f"📡 국립국어원 표준국어대사전 Open API: 연동 활성화 (인증키: {masked_key})")
+    else:
+        print("💡 국립국어원 Open API 키가 설정되지 않았습니다.")
+        print("   -> .env 파일의 KOREAN_DICT_API_KEY 항목에 인증키를 입력하시면")
+        print("      실시간 50만 표준어 검사가 즉시 연동됩니다! (현재는 로컬 사전 모드)")
     print("=" * 60)
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
