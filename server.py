@@ -833,6 +833,8 @@ if __name__ == "__main__":
         print("💡 국립국어원 Open API 키가 설정되지 않았습니다.")
         print("   -> .env 파일의 KOREAN_DICT_API_KEY 항목에 인증키를 입력하시면")
         print("      실시간 50만 표준어 검사가 즉시 연동됩니다! (현재는 로컬 사전 모드)")
+    port = int(os.environ.get("PORT", 8000))
+    print(f"👉 접속 포트: {port}")
     print("=" * 60)
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
